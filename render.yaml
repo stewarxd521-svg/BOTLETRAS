@@ -1,0 +1,58 @@
+services:
+  - type: web
+    name: hypeusdt-candle-bot
+    runtime: python
+    region: oregon                 # cambia a frankfurt si quieres menor latencia a Europa
+    plan: starter                  # starter = $7/mes (no duerme); free duerme tras 15 min
+
+    buildCommand: pip install -r requirements.txt
+
+    # Render inyecta la variable PORT automáticamente
+    startCommand: python bot.py
+
+    healthCheckPath: /health
+
+    # ── Variables de entorno ─────────────────────────────────────────────────
+    # Puedes sobreescribirlas en el dashboard de Render → Environment
+    envVars:
+
+      # Trading
+      - key: SYMBOL
+        value: HYPEUSDT
+      - key: INTERVAL
+        value: 1m
+      - key: CAPITAL
+        value: "1000.0"
+      - key: TP_PCT
+        value: "0.009"           # 0.9% take profit
+      - key: SL_PCT
+        value: "0.010"           # 1.0% stop loss
+      - key: MIN_CONFIDENCE
+        value: "0.50"            # confianza mínima del modelo
+      - key: POS_SIZE_PCT
+        value: "0.012"           # 1.2% del capital por trade
+      - key: FEE_PCT
+        value: "0.0004"          # 0.04% comisión por lado (Binance Futures VIP0)
+      - key: MAX_HOLD
+        value: "60"              # máximo 60 velas (~60 min) en posición
+      - key: DIR_THRESHOLD
+        value: "0.02"            # sesgo mínimo para clasificar LONG/SHORT
+
+      # Operación
+      - key: LOOP_INTERVAL
+        value: "60"              # segundos entre cada ciclo del bot
+      - key: N_KLINES_INIT
+        value: "1500"            # velas para entrenamiento inicial
+      - key: N_KLINES_LIVE
+        value: "200"             # velas descargadas en cada ciclo live
+      - key: TRAIN_RATIO
+        value: "0.85"            # fracción train/val al entrenar
+      - key: MODEL_DIR
+        value: "candle_model"    # directorio del modelo (relativo al repo)
+
+    # ── Disco persistente (opcional, evita re-entrenar en cada deploy) ───────
+    # Descomenta estas líneas si tienes un plan con soporte de discos en Render:
+    # disk:
+    #   name: model-storage
+    #   mountPath: /opt/render/project/src/candle_model
+    #   sizeGB: 1
