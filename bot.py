@@ -31,7 +31,7 @@ from flask import Flask, jsonify, Response
 
 # ── Importar el sistema predictor (mismo directorio) ──────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from candle_predictor import CandlePatternSystem, CandleEncoder, NgramPredictor, SYMBOLS
+from candle_predictor import CandlePatternSystem, CandleEncoder, NgramPredictor
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN VÍA ENTORNO
