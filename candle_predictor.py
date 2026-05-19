@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 SYMBOLS     = list("ABCDEFGHIJKLMNOPQRST")   # 20 símbolos posibles
 WINDOW_SIZE = 10                              # velas por patrón
 N_CLUSTERS  = 20                              # máximo de clusters
-MAX_N       = 5                               # orden máximo del n-grama
+MAX_N       = 3                               # orden máximo del n-grama
 MODEL_DIR   = Path("candle_model")
 
 
