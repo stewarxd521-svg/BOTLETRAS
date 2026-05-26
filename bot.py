@@ -52,17 +52,17 @@ SYMBOL          = os.getenv("SYMBOL",          "HYPEUSDT")
 INTERVAL        = os.getenv("INTERVAL",        "1m")
 MODEL_DIR       = Path(os.getenv("MODEL_DIR",  "candle_model"))
 CAPITAL         = float(os.getenv("CAPITAL",         "1000.0"))
-TP_PCT          = float(os.getenv("TP_PCT",          "0.010"))
-SL_PCT          = float(os.getenv("SL_PCT",          "0.010"))
+TP_PCT          = float(os.getenv("TP_PCT",          "0.015"))
+SL_PCT          = float(os.getenv("SL_PCT",          "0.005"))
 MIN_CONFIDENCE  = float(os.getenv("MIN_CONFIDENCE",  "0.50"))
 POS_SIZE_PCT    = float(os.getenv("POS_SIZE_PCT",    "0.012"))
-FEE_PCT         = float(os.getenv("FEE_PCT",         "0.0004"))
+FEE_PCT         = float(os.getenv("FEE_PCT",         "0.0000"))
 MAX_HOLD        = int(os.getenv("MAX_HOLD",          "1000"))
 DIR_THRESHOLD   = float(os.getenv("DIR_THRESHOLD",   "0.02"))
 LOOP_INTERVAL   = int(os.getenv("LOOP_INTERVAL",     "60"))
 N_KLINES_INIT   = int(os.getenv("N_KLINES_INIT",     "1500"))
 N_KLINES_LIVE   = int(os.getenv("N_KLINES_LIVE",     "1400"))  # suficiente para el encoder + historial de la posición
-TRAIN_RATIO     = float(os.getenv("TRAIN_RATIO",      "0.85"))
+TRAIN_RATIO     = float(os.getenv("TRAIN_RATIO",      "0.70"))
 PORT            = int(os.getenv("PORT",               "10000"))
 BINANCE_API     = "https://fapi.binance.com/fapi/v1/klines"
 MAX_TRADES_LOG  = 200
@@ -133,6 +133,40 @@ def download_candles(symbol: str, interval: str, limit: int) -> pd.DataFrame:
              "EMA_200","RSI_14","ATR_14","num_trades"]].reset_index(drop=True)
     return df
 
+def _interval_to_seconds(interval: str) -> int:
+    interval = interval.strip().lower()
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3600
+    if interval.endswith("d"):
+        return int(interval[:-1]) * 86400
+    if interval.endswith("w"):
+        return int(interval[:-1]) * 7 * 86400
+    if interval.endswith("M"):
+        return int(interval[:-1]) * 30 * 86400
+    raise ValueError(f"Intervalo no soportado: {interval}")
+
+
+def _drop_unclosed_last_candle(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Binance REST suele devolver la vela actual en formación como última fila.
+    Para que el encoder vea exactamente el mismo tipo de input que el simulador
+    (velas cerradas), eliminamos esa última fila si aún no ha cerrado.
+    """
+    if len(df) <= 1:
+        return df.copy()
+
+    last_open = pd.Timestamp(df.iloc[-1]["open_time"])
+    close_time = last_open + pd.Timedelta(seconds=_interval_to_seconds(interval))
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    if now_utc < close_time:
+        return df.iloc[:-1].copy()
+    return df.copy()
+
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DIRECCIONALIDAD DE CLUSTERS
@@ -165,7 +199,7 @@ def load_or_train_model() -> tuple:
         log.info(f"Modelo no encontrado. Descargando {N_KLINES_INIT} velas para entrenar...")
         with _lock:
             state["status"] = "entrenando"
-        df  = download_candles(SYMBOL, INTERVAL, N_KLINES_INIT)
+        df  = _drop_unclosed_last_candle(download_candles(SYMBOL, INTERVAL, N_KLINES_INIT), INTERVAL)
         log.info(f"  {len(df)} velas descargadas. Entrenando...")
         system   = CandlePatternSystem(model_dir=MODEL_DIR)
         sequence = system.encoder.fit_transform(df)
@@ -334,6 +368,7 @@ def generate_signal(df: pd.DataFrame, system: CandlePatternSystem,
     """
     Codifica el df completo → secuencia de símbolos → predice el siguiente.
     Retorna un dict con la señal o None si no hay señal operable.
+    IMPORTANTE: el df debe contener solo velas cerradas para no desalinear el símbolo final.
     """
     MAX_N  = system.predictor.max_n
     WINDOW = system.encoder.window_size
@@ -417,7 +452,7 @@ def trading_loop(system: CandlePatternSystem, dirs: dict) -> None:
         loop_start = time.time()
         try:
             # ── 1. Descargar velas ─────────────────────────────────────────
-            df = download_candles(SYMBOL, INTERVAL, N_KLINES_LIVE)
+            df = _drop_unclosed_last_candle(download_candles(SYMBOL, INTERVAL, N_KLINES_LIVE), INTERVAL)
             last_row      = df.iloc[-1]
             current_price = float(last_row["close"])
 
