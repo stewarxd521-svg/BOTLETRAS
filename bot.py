@@ -11,7 +11,8 @@
 ║   3. Si no hay posición → codifica las últimas velas con el encoder,        ║
 ║      predice el próximo símbolo (N-gram), y abre trade si la confianza      ║
 ║      supera MIN_CONFIDENCE y la dirección no es NEUTRAL.                    ║
-║   4. Expone dashboard web en / y endpoints JSON en /api/*.                  ║
+║   4. Sesgo live: 2 operaciones normales → 2 invertidas → repetir.           ║
+║   5. Expone dashboard web en / y endpoints JSON en /api/*.                  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -66,6 +67,12 @@ TRAIN_RATIO     = float(os.getenv("TRAIN_RATIO",      "0.70"))
 PORT            = int(os.getenv("PORT",               "10000"))
 BINANCE_API     = "https://fapi.binance.com/fapi/v1/klines"
 MAX_TRADES_LOG  = 200
+NORMAL_COUNT   = max(0, int(os.getenv("NORMAL_COUNT",   "2")))
+INVERT_COUNT   = max(0, int(os.getenv("INVERT_COUNT",   "2")))
+if NORMAL_COUNT + INVERT_COUNT <= 0:
+    NORMAL_COUNT = 2
+    INVERT_COUNT = 2
+VARIABILITY_CYCLE = NORMAL_COUNT + INVERT_COUNT
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -104,6 +111,7 @@ state = {
     "loops_completed":  0,
     "model_loaded":     False,
     "symbol_dirs":      {},
+    "trade_sequence":   0,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -215,12 +223,48 @@ def load_or_train_model() -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SESGO DE VARIABILIDAD: 2 NORMAL → 2 INVERTIDA → ...
+# ══════════════════════════════════════════════════════════════════════════════
+
+def flip_direction(direction: str) -> str:
+    """Invierte una dirección operable LONG/SHORT."""
+    return "SHORT" if direction == "LONG" else "LONG"
+
+
+def resolve_variability_mode(base_direction: str) -> dict:
+    """
+    Decide si la próxima operación respeta la señal del modelo o la invierte.
+
+    El contador avanza únicamente cuando se abre una posición real. Por defecto,
+    el ciclo es: operaciones 1-2 NORMAL y operaciones 3-4 INVERTIDA.
+    """
+    trade_seq = state["trade_sequence"]
+    pos_in_cycle = trade_seq % VARIABILITY_CYCLE
+    is_inverted = pos_in_cycle >= NORMAL_COUNT
+    mode = "INVERTIDA" if is_inverted else "NORMAL"
+    direction = flip_direction(base_direction) if is_inverted else base_direction
+
+    return {
+        "mode": mode,
+        "direction": direction,
+        "base_direction": base_direction,
+        "is_inverted": is_inverted,
+        "trade_sequence": trade_seq + 1,
+        "cycle_position": pos_in_cycle + 1,
+        "cycle_length": VARIABILITY_CYCLE,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  GESTIÓN DE POSICIÓN  (idéntica a simulate_trade de binance_simulator)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def open_position(direction: str, entry_price: float,
                   entry_ts: pd.Timestamp,
-                  confidence: float, pred_symbol: str, context: str) -> None:
+                  confidence: float, pred_symbol: str, context: str,
+                  mode: str = "NORMAL", base_direction: Optional[str] = None,
+                  is_inverted: bool = False, cycle_position: int = 1,
+                  cycle_length: int = VARIABILITY_CYCLE) -> None:
     """
     Abre una posición simulada.
     entry_ts: timestamp de la vela de señal (la entrada es la SIGUIENTE vela,
@@ -231,6 +275,12 @@ def open_position(direction: str, entry_price: float,
 
     state["position"] = {
         "direction":   direction,
+        "base_direction": base_direction or direction,
+        "mode":        mode,
+        "is_inverted": is_inverted,
+        "trade_sequence": state["trade_sequence"] + 1,
+        "cycle_position": cycle_position,
+        "cycle_length": cycle_length,
         "entry_price": round(entry_price, 6),
         "tp_price":    round(tp_price, 6),
         "sl_price":    round(sl_price, 6),
@@ -241,10 +291,14 @@ def open_position(direction: str, entry_price: float,
         "pred_symbol": pred_symbol,
         "context":     context,
     }
+    state["trade_sequence"] += 1
+    tag = "🔄" if is_inverted else "  "
     log.info(
-        f"📂 ABRE {direction} │ entrada={entry_price:.5f} │ "
+        f"📂 ABRE #{state['trade_sequence']} {tag}{mode} {direction} "
+        f"(modelo={base_direction or direction}) │ entrada={entry_price:.5f} │ "
         f"TP={tp_price:.5f} SL={sl_price:.5f} │ "
-        f"conf={confidence:.1%} ctx={context}→{pred_symbol}"
+        f"conf={confidence:.1%} ctx={context}→{pred_symbol} │ "
+        f"ciclo={cycle_position}/{cycle_length}"
     )
 
 
@@ -329,6 +383,12 @@ def _register_close(exit_price: float, pnl_pct: float,
     trade = {
         "id":            len(state["trades"]) + 1,
         "direction":     pos["direction"],
+        "base_direction": pos.get("base_direction", pos["direction"]),
+        "mode":          pos.get("mode", "NORMAL"),
+        "is_inverted":   pos.get("is_inverted", False),
+        "trade_sequence": pos.get("trade_sequence"),
+        "cycle_position": pos.get("cycle_position"),
+        "cycle_length":  pos.get("cycle_length"),
         "entry_price":   pos["entry_price"],
         "exit_price":    round(float(exit_price), 6),
         "entry_time":    pos["entry_time"],
@@ -350,7 +410,8 @@ def _register_close(exit_price: float, pnl_pct: float,
 
     emoji = "✅" if result == "WIN" else ("❌" if result == "LOSS" else "⚠️")
     log.info(
-        f"{emoji} CIERRE {result} │ {pos['direction']} │ "
+        f"{emoji} CIERRE {result} │ {pos.get('mode', 'NORMAL')} {pos['direction']} "
+        f"(modelo={pos.get('base_direction', pos['direction'])}) │ "
         f"entrada={pos['entry_price']:.5f} salida={exit_price:.5f} │ "
         f"velas={candles_held} │ "
         f"P&L={pnl_pct*100:+.3f}% (${pnl_usdt:+.4f}) │ "
@@ -402,6 +463,7 @@ def generate_signal(df: pd.DataFrame, system: CandlePatternSystem,
         "price":       float(df.iloc[-1]["close"]),
         "pred_symbol": next_sym,
         "direction":   direction,
+        "base_direction": direction,
         "confidence":  round(confidence, 4),
         "context":     "".join(ctx[-4:]),
         "n_used":      best.get("n_used", 0),
@@ -481,13 +543,28 @@ def trading_loop(system: CandlePatternSystem, dirs: dict) -> None:
 
                     if signal and signal["confidence"] >= MIN_CONFIDENCE \
                                and signal["direction"] in ("LONG", "SHORT"):
+                        variability = resolve_variability_mode(signal["direction"])
+                        signal.update({
+                            "mode": variability["mode"],
+                            "final_direction": variability["direction"],
+                            "is_inverted": variability["is_inverted"],
+                            "cycle_position": variability["cycle_position"],
+                            "cycle_length": variability["cycle_length"],
+                            "trade_sequence": variability["trade_sequence"],
+                        })
+                        state["last_signal"] = signal
                         open_position(
-                            direction    = signal["direction"],
-                            entry_price  = signal["price"],           # close de la última vela
-                            entry_ts     = last_row["open_time"],     # timestamp para filtrar futuras velas
-                            confidence   = signal["confidence"],
-                            pred_symbol  = signal["pred_symbol"],
-                            context      = signal["context"],
+                            direction      = variability["direction"],
+                            entry_price    = signal["price"],           # close de la última vela
+                            entry_ts       = last_row["open_time"],     # timestamp para filtrar futuras velas
+                            confidence     = signal["confidence"],
+                            pred_symbol    = signal["pred_symbol"],
+                            context        = signal["context"],
+                            mode           = variability["mode"],
+                            base_direction = variability["base_direction"],
+                            is_inverted    = variability["is_inverted"],
+                            cycle_position = variability["cycle_position"],
+                            cycle_length   = variability["cycle_length"],
                         )
                     elif signal:
                         reason = (
@@ -601,7 +678,11 @@ def api_status():
                 "max_hold":       MAX_HOLD,
                 "loop_interval":  LOOP_INTERVAL,
                 "n_klines_live":  N_KLINES_LIVE,
+                "normal_count":   NORMAL_COUNT,
+                "invert_count":   INVERT_COUNT,
+                "variability_cycle": VARIABILITY_CYCLE,
             },
+            "trade_sequence": state["trade_sequence"],
             "stats": _stats(),
         })
 
@@ -692,6 +773,9 @@ async function load(){
       &nbsp;|&nbsp; TP: <span class="win">$${s.position.tp_price.toFixed(5)}</span>
       &nbsp;|&nbsp; SL: <span class="loss">$${s.position.sl_price.toFixed(5)}</span><br>
       Velas en posición: <b>${s.position.candles_held}</b> / ${s.config.max_hold}<br>
+      Modo: <b>${s.position.mode??'NORMAL'}</b>
+      &nbsp;| Modelo: <b>${s.position.base_direction??s.position.direction}</b>
+      &nbsp;| Ciclo: <b>${s.position.cycle_position??'?'} / ${s.position.cycle_length??s.config.variability_cycle}</b><br>
       Confianza: <b>${(s.position.confidence*100).toFixed(1)}%</b>
       &nbsp;| Símbolo: <b>${s.position.pred_symbol}</b>
       &nbsp;| Contexto: <b>${s.position.context}</b><br>
@@ -708,8 +792,9 @@ async function load(){
       &nbsp;| n-gram orden: ${s.last_signal.n_used}<br>
       Ctx: <b>${s.last_signal.context}</b> → <b>${s.last_signal.pred_symbol}</b>
       &nbsp;|&nbsp;
-      Dir: <span class="${s.last_signal.direction==='LONG'?'win':s.last_signal.direction==='SHORT'?'loss':''}">
+      Dir modelo: <span class="${s.last_signal.direction==='LONG'?'win':s.last_signal.direction==='SHORT'?'loss':''}">
         <b>${s.last_signal.direction}</b></span>
+      ${s.last_signal.final_direction?`&nbsp;| Final: <b>${s.last_signal.final_direction}</b> (${s.last_signal.mode})`:''}
       &nbsp;| Conf: <b>${(s.last_signal.confidence*100).toFixed(1)}%</b><br>
       Top5: ${(s.last_signal.top5||[]).map(x=>
         `<span style="color:${x.dir==='LONG'?'#3fb950':x.dir==='SHORT'?'#f85149':'#8b949e'}">
@@ -718,6 +803,7 @@ async function load(){
 
   const rows=trades.map(t=>`<tr>
     <td>${t.id}</td>
+    <td>${t.mode??'NORMAL'}</td>
     <td class="${t.direction==='LONG'?'long':'short'}">${t.direction==='LONG'?'▲':'▼'} ${t.direction}</td>
     <td>$${t.entry_price.toFixed(5)}</td>
     <td>$${t.exit_price.toFixed(5)}</td>
@@ -773,6 +859,11 @@ async function load(){
       <div class="val" style="font-size:.9rem">${s.last_candle_time?.slice(11,19)??'N/A'}</div>
       <div class="sub">Cada ${s.config.loop_interval}s | ${s.config.n_klines_live} velas/ciclo</div>
     </div>
+    <div class="card">
+      <div class="lbl">Variabilidad</div>
+      <div class="val" style="font-size:1rem">${s.config.normal_count} normal / ${s.config.invert_count} invertida</div>
+      <div class="sub">Ops abiertas: ${s.trade_sequence} | Ciclo: ${s.config.variability_cycle}</div>
+    </div>
   </div>
 
   <div class="sec"><h2>Posición Actual</h2>${posHtml}</div>
@@ -783,7 +874,7 @@ async function load(){
     ${trades.length===0?'<p class="np">Sin trades aún.</p>':
     `<table>
       <thead><tr>
-        <th>#</th><th>Dir</th><th>Entrada</th><th>Salida</th>
+        <th>#</th><th>Modo</th><th>Dir</th><th>Entrada</th><th>Salida</th>
         <th>Resultado</th><th>P&L%</th><th>P&L$</th>
         <th>Velas</th><th>Conf</th><th>Cierre</th>
       </tr></thead>
@@ -812,6 +903,10 @@ def main():
     log.info(f"  TP={TP_PCT*100:.1f}% | SL={SL_PCT*100:.1f}% | MaxHold={MAX_HOLD} velas")
     log.info(f"  Capital=${CAPITAL:,.0f} | PosSize={POS_SIZE_PCT*100:.1f}% | Fee={FEE_PCT*100:.3f}%/lado")
     log.info(f"  Conf≥{MIN_CONFIDENCE:.0%} | Loop={LOOP_INTERVAL}s | Velas/ciclo={N_KLINES_LIVE}")
+    log.info(
+        f"  Variabilidad={NORMAL_COUNT} normales + {INVERT_COUNT} invertidas "
+        f"(ciclo {VARIABILITY_CYCLE} operaciones)"
+    )
     log.info("=" * 62)
 
     try:
