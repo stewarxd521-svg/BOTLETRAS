@@ -103,7 +103,9 @@ La página se auto-recarga cada 30 segundos.
 | `MAX_HOLD`       | 60         | Velas máximas en posición (timeout)      |
 | `LOOP_INTERVAL`  | 60         | Segundos entre ciclos del bot            |
 | `N_KLINES_INIT`  | 1500       | Velas para entrenamiento inicial         |
-| `N_KLINES_LIVE`  | 200        | Velas descargadas en cada ciclo live     |
+| `N_KLINES_LIVE`  | 1400       | Velas descargadas en cada ciclo live     |
+| `NORMAL_COUNT`   | 2          | Operaciones que respetan la dirección del modelo por ciclo |
+| `INVERT_COUNT`   | 2          | Operaciones que invierten LONG↔SHORT por ciclo             |
 
 ---
 
@@ -122,6 +124,7 @@ La página se auto-recarga cada 30 segundos.
 ## Notas importantes
 
 - El bot realiza **operaciones 100% simuladas** (no mueve dinero real).
+- El bot alterna el sesgo de variabilidad en vivo: por defecto abre **2 operaciones normales** con la dirección del modelo y luego **2 operaciones invertidas** (LONG↔SHORT), repitiendo el ciclo sin abrir más de una posición simultánea.
 - El modelo se re-entrena solo si no existe `candle_model/` en el repositorio.
 - El estado (trades, capital, posición) vive **en memoria**: se resetea en cada deploy.
   Para persistencia duradera, activa el **disco persistente** en `render.yaml` (ver comentarios).
